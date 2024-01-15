@@ -1,0 +1,80 @@
+#version 460
+
+layout(set = 0, binding = 0) restrict readonly buffer VertexAttributes { vec4 pos[]; };
+layout(set = 0, binding = 1) restrict readonly buffer Indices { uint index[]; };
+layout(set = 1, binding = 0, r32f) uniform coherent image2D ZBuffer[11];
+layout(set = 2, binding = 0) restrict writeonly buffer OutputVertices { vec4 posOut[]; };
+layout(set = 2, binding = 1) coherent buffer IndirectBuffer { uint vertexCount; uint instanceCount; uint firstVertex; uint firstInstance; };
+
+layout(push_constant) uniform PushConstants 
+{
+    mat4 matrixVP; 
+    vec3 lightDirection;
+    uint mipLevelCount;
+};
+
+layout(local_size_x = 1024) in;
+
+void main()
+{
+    // init indirect
+    if(gl_GlobalInvocationID.x == 0)
+    {
+        vertexCount = 0;
+        instanceCount = 1;
+        firstVertex = 0;
+        firstInstance = 0;
+    }
+    barrier();
+    memoryBarrier();
+
+    // each thread handles one triangle face
+    const uint totalFaceCount = index.length() / 3;
+    if(gl_GlobalInvocationID.x >= totalFaceCount) return;
+
+    const uint triangleIndex = gl_GlobalInvocationID.x;
+    const mat3x4 matrixVert = mat3x4(pos[index[3 * gl_GlobalInvocationID.x + 0]],
+                                     pos[index[3 * gl_GlobalInvocationID.x + 1]],
+                                     pos[index[3 * gl_GlobalInvocationID.x + 2]]);
+    mat3x4 matrixNDC = matrixVP * matrixVert;
+    matrixNDC[0].xyz /= matrixNDC[0].w;
+    matrixNDC[1].xyz /= matrixNDC[1].w;
+    matrixNDC[2].xyz /= matrixNDC[2].w;
+
+    const ivec2 resolution = imageSize(ZBuffer[0]);
+    matrixNDC[0].xy = (matrixNDC[0].xy * .5f + .5f) * resolution;
+    matrixNDC[1].xy = (matrixNDC[1].xy * .5f + .5f) * resolution;
+    matrixNDC[2].xy = (matrixNDC[2].xy * .5f + .5f) * resolution;
+
+    const vec3 minBound = min(matrixNDC[0].xyz, min(matrixNDC[1].xyz, matrixNDC[2].xyz));
+    const vec3 maxBound = max(matrixNDC[0].xyz, max(matrixNDC[1].xyz, matrixNDC[2].xyz));
+
+    const vec3 normal = cross(matrixNDC[1].xyz - matrixNDC[0].xyz, matrixNDC[2].xyz - matrixNDC[1].xyz);
+    if(int(minBound.x) == int(maxBound.x) || int(minBound.y) == int(maxBound.y) || normal.z > .0f || 
+      (maxBound.x < 0 && maxBound.y < 0) || (minBound.x >= resolution.x && minBound.y >= resolution.y)) // cull subpixel, completely outside screen and back faces
+        return;
+
+    const ivec2 boundSize = ivec2(maxBound.xy - minBound.xy) * resolution;
+    float mipLevel = ceil(log2(max(boundSize.x, boundSize.y)));
+    mipLevel = clamp(mipLevel, 0, mipLevelCount - 1);
+
+    const ivec4 sampledCoords = ivec4(minBound.xy, maxBound.xy) >> uint(mipLevel);
+    const vec4 sampledDepth = vec4(imageLoad(ZBuffer[uint(mipLevel)], ivec2(sampledCoords.xy)).x,
+                                   imageLoad(ZBuffer[uint(mipLevel)], ivec2(sampledCoords.zw)).x,
+                                   imageLoad(ZBuffer[uint(mipLevel)], ivec2(sampledCoords.xw)).x,
+                                   imageLoad(ZBuffer[uint(mipLevel)], ivec2(sampledCoords.zy)).x);
+    const float maxSampleDepth = max(max(sampledDepth.x, sampledDepth.y), max(sampledDepth.z, sampledDepth.w));
+
+    // reconstruct depth
+    float minFaceDepth = minBound.z * 2 - 1;
+    minFaceDepth = (2 * .01f) / (1000.f + .01f - minFaceDepth * (1000.f - .01f)); 
+
+    if(minFaceDepth <= maxSampleDepth)
+    {
+        const uint offset = atomicAdd(vertexCount, 3U);
+        posOut[offset] = matrixVert[0];
+        posOut[offset + 1] = matrixVert[1];
+        posOut[offset + 2] = matrixVert[2];
+        memoryBarrier();
+    }
+}

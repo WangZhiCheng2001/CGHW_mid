@@ -1,0 +1,65 @@
+#version 460
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_debug_printf : enable
+
+struct ScanlineAttribute
+{
+    vec3 faceNormal;
+    float xStart;
+    float xEnd;
+    int y;
+    float zStart;
+    float dzdx;
+};
+
+layout(set = 1, binding = 0) restrict readonly buffer ScanlineAttributes { ScanlineAttribute filledLines[]; };
+layout(set = 1, binding = 1) restrict readonly buffer GlobalProperty { uvec3 workgroupCount; uint scanlineCount; };
+layout(set = 1, binding = 2, r32ui) uniform coherent uimage2D spinlock; 
+layout(set = 1, binding = 3, rgba8) uniform coherent image2D colorBuffer;
+layout(set = 2, binding = 0, r32f) uniform coherent image2D ZBuffer[11];
+
+layout(push_constant) uniform PushConstants 
+{
+    mat4 matrixVP; 
+    vec3 lightDirection;
+    uint mipLevelCount;
+};
+
+layout(local_size_x = 1024) in;
+
+void main()
+{
+    // each thread handles one triangle face
+    if(gl_GlobalInvocationID.x >= scanlineCount) return;
+
+    const ScanlineAttribute scanline = filledLines[gl_GlobalInvocationID.x];
+    [[unroll]]
+    for(int x = int(scanline.xStart), dx = 0; x <= int(scanline.xEnd); ++x, ++dx)
+    {
+        float depth = scanline.zStart + scanline.dzdx * dx;
+        // reconstruct linear depth
+        depth = depth * 2 - 1;
+        depth = (2 * .01f) / (1000.f + .01f - depth * (1000.f - .01f));
+        const ivec2 pos = ivec2(x, scanline.y);
+
+        bool writtenDone = false;
+        while(!writtenDone)
+        {
+            bool canWrite = (imageAtomicExchange(spinlock, pos, 0X7FFFFFFF) != 0x7FFFFFFF);
+            float prevDepth = imageLoad(ZBuffer[0], pos).x;
+            if(canWrite)
+            {
+                if(prevDepth > depth)
+                {
+                    imageStore(ZBuffer[0], pos, vec4(depth, 0, 0, 0));
+                    imageStore(colorBuffer, pos, vec4(dot(scanline.faceNormal, lightDirection)));
+                }
+                writtenDone = true;
+            }
+            memoryBarrier();
+            imageAtomicExchange(spinlock, pos, 0U);
+            memoryBarrier();
+        }
+    }
+}

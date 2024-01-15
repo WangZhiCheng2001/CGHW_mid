@@ -1,0 +1,103 @@
+#version 460
+
+layout(set = 0, binding = 0) restrict readonly buffer VertexAttributes { vec4 pos[]; };
+layout(set = 0, binding = 1) restrict readonly buffer Indices { uint index[]; };
+layout(set = 1, binding = 0, r32f) restrict readonly uniform image2D ZBuffer[11];
+layout(set = 2, binding = 0) restrict writeonly buffer OutputVertices { vec4 posOut[]; };
+layout(set = 2, binding = 1) coherent buffer IndirectBuffer { uint vertexCount; uint instanceCount; uint firstVertex; uint firstInstance; };
+layout(set = 3, binding = 0, r32ui) restrict readonly uniform uimage3D octreeLinkHeader[5];
+layout(set = 3, binding = 1, r32ui) coherent uniform uimage3D octreeLinkMarker[5];
+layout(set = 3, binding = 2) coherent buffer FaceIndices { uvec2 linkedIndices[]; };
+
+layout(push_constant) uniform PushConstants 
+{
+    mat4 matrixVP; 
+    vec3 lightDirection;
+    uint mipLevelCount;
+    vec4 minBoundWorld;
+    vec4 maxBoundWorld;
+};
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main()
+{
+    const uint mipLevel = linkedIndices[0].y;
+    const uint gridLength = 1 << mipLevel;
+    const float gridLengthInv = 1 / float(gridLength);
+
+    const uvec2 resolution = imageSize(ZBuffer[0]);
+    vec4 minBoundNDC = matrixVP * minBoundWorld;
+    vec4 maxBoundNDC = matrixVP * maxBoundWorld;
+    minBoundNDC /= minBoundNDC.w;
+    maxBoundNDC /= maxBoundNDC.w;
+    minBoundNDC.xy = clamp(minBoundNDC.xy * .5f + .5f, 0, 1) * resolution;
+    maxBoundNDC.xy = clamp(maxBoundNDC.xy * .5f + .5f, 0, 1) * resolution;
+    minBoundNDC.z = clamp(minBoundNDC.z, 0, 1);
+    maxBoundNDC.z = clamp(maxBoundNDC.z, 0, 1);
+    const vec4 temp1 = minBoundNDC, temp2 = maxBoundNDC;
+    minBoundNDC = min(temp1, temp2);
+    maxBoundNDC = max(temp1, temp2);
+
+    const vec3 gridExtent = (maxBoundNDC - minBoundNDC).xyz * gridLengthInv;
+    float zbufferMipLevel = ceil(log2(max(gridExtent.x, gridExtent.y)));
+    zbufferMipLevel = clamp(zbufferMipLevel, 0, mipLevelCount - 1);
+    const ivec4 sampledCoords = ivec4(minBoundNDC.xy, maxBoundNDC.xy) >> uint(zbufferMipLevel);
+    const vec4 sampledDepth = vec4(imageLoad(ZBuffer[uint(zbufferMipLevel)], ivec2(sampledCoords.xy)).x,
+                                   imageLoad(ZBuffer[uint(zbufferMipLevel)], ivec2(sampledCoords.zw)).x,
+                                   imageLoad(ZBuffer[uint(zbufferMipLevel)], ivec2(sampledCoords.xw)).x,
+                                   imageLoad(ZBuffer[uint(zbufferMipLevel)], ivec2(sampledCoords.zy)).x);
+    const float maxSampleDepth = max(max(sampledDepth.x, sampledDepth.y), max(sampledDepth.z, sampledDepth.w));
+
+    ivec3 gridIndex = ivec3(gl_GlobalInvocationID.x, gl_GlobalInvocationID.y, 0);
+    float gridMinDepth = minBoundNDC.z;
+    bool culled = false;
+    for(uint i = 0; i < gridLength; ++i)
+    {
+        uint header = imageLoad(octreeLinkHeader[mipLevel], gridIndex).x;
+        if(header == 0xFFFFFFFF || culled)
+            continue;
+
+        // reconstruct depth
+        float minFaceDepth = gridMinDepth * 2 - 1;
+        minFaceDepth = (2 * .01f) / (1000.f + .01f - minFaceDepth * (1000.f - .01f)); 
+
+        if(!(culled = minFaceDepth > maxSampleDepth))
+        {
+            while(header != 0xFFFFFFFF)
+            {
+                const uint triangleIndex = linkedIndices[header].x;
+                const mat3x4 matrixVert = mat3x4(pos[index[3 * triangleIndex + 0]],
+                                                pos[index[3 * triangleIndex + 1]],
+                                                pos[index[3 * triangleIndex + 2]]);
+                mat3x4 matrixNDC = matrixVP * matrixVert;
+                matrixNDC[0].xyz /= matrixNDC[0].w;
+                matrixNDC[1].xyz /= matrixNDC[1].w;
+                matrixNDC[2].xyz /= matrixNDC[2].w;
+
+                matrixNDC[0].xy = (matrixNDC[0].xy * .5f + .5f) * resolution;
+                matrixNDC[1].xy = (matrixNDC[1].xy * .5f + .5f) * resolution;
+                matrixNDC[2].xy = (matrixNDC[2].xy * .5f + .5f) * resolution;
+
+                if(min(matrixNDC[0].z, min(matrixNDC[1].z, matrixNDC[2].z)) <= maxSampleDepth)
+                {
+                    const uint offset = atomicAdd(vertexCount, 3U);
+                    posOut[offset] = matrixVert[0];
+                    posOut[offset + 1] = matrixVert[1];
+                    posOut[offset + 2] = matrixVert[2];
+                }
+
+                header = linkedIndices[header].y;
+            }
+        }
+
+        gridIndex.z++;
+        gridMinDepth += gridExtent.z;
+    }
+
+    barrier();
+    memoryBarrier();
+
+    if(gl_GlobalInvocationID.x == 0 && gl_GlobalInvocationID.y == 0)
+        linkedIndices[0].y += 1;
+}

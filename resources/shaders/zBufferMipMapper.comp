@@ -1,0 +1,37 @@
+#version 460
+
+layout(binding = 0, r32f) uniform coherent image2D ZBuffer[11];
+
+layout(push_constant) uniform PushConstants 
+{
+    mat4 matrixVP; 
+    vec3 lightDirection;
+    uint mipLevelCount;
+};
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+void main()
+{
+    uvec2 resolution = imageSize(ZBuffer[0]);
+
+    for(uint i = 0; i < mipLevelCount - 1; ++i)
+    {
+        if(gl_GlobalInvocationID.x < resolution.x && gl_GlobalInvocationID.y < resolution.y)
+        {
+            const ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+            const vec4 tileDepth = vec4(imageLoad(ZBuffer[i], pos).x,
+                                        imageLoad(ZBuffer[i], pos + ivec2(0, 1)).x,
+                                        imageLoad(ZBuffer[i], pos + ivec2(1, 0)).x,
+                                        imageLoad(ZBuffer[i], pos + ivec2(1, 1)).x);
+
+            imageStore(ZBuffer[i + 1], ivec2(pos.x >> 1, pos.y >> 1), vec4(max(max(tileDepth.x, tileDepth.y), max(tileDepth.z, tileDepth.w)), 0, 0, 0));
+        }
+
+        barrier();
+        memoryBarrier();
+
+        resolution.x >>= 1;
+        resolution.y >>= 1;
+    }
+}

@@ -1,0 +1,7 @@
+target("Engine")
+    set_kind("static")
+    add_files("./*/*.cpp")
+    add_includedirs("./", "./asset", "./entity", "./renderer", "./RHI", "./utils", {public = true})
+    add_deps("BuiltinResources")
+    add_deps("rapidobj")
+    add_packages("vulkansdk", "imgui", "spdlog", "glm")

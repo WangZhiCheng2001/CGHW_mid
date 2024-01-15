@@ -1,0 +1,133 @@
+#version 460
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_debug_printf : enable
+
+struct ScanlineAttribute
+{
+    vec3 faceNormal;
+    float xStart;
+    float xEnd;
+    int y;
+    float zStart;
+    float dzdx;
+};
+
+layout(set = 0, binding = 0) restrict readonly buffer VertexAttributes { vec4 pos[]; };
+layout(set = 0, binding = 1) restrict readonly buffer Indices { uint index[]; };
+
+layout(set = 1, binding = 0) restrict writeonly buffer ScanlineAttributes { ScanlineAttribute filledLines[]; };
+layout(set = 1, binding = 1) coherent buffer GlobalProperty { uvec3 workgroupCount; uint scanlineCount; };
+layout(set = 1, binding = 2, r32ui) uniform coherent uimage2D spinlock; 
+
+layout(push_constant) uniform PushConstants 
+{
+    mat4 matrixVP; 
+    vec3 lightDirection;
+    uint mipLevelCount;
+};
+
+layout(local_size_x = 1024) in;
+
+void main()
+{
+    // init global properties
+    if(gl_GlobalInvocationID.x == 0)
+        scanlineCount = 0;
+    barrier();
+    memoryBarrier();
+
+    // each thread handles one triangle face
+    const uint totalFaceCount = index.length() / 3;
+    if(gl_GlobalInvocationID.x >= totalFaceCount) return;
+
+    const uint triangleIndex = gl_GlobalInvocationID.x;
+    const mat3x4 matrixVert = mat3x4(pos[index[3 * gl_GlobalInvocationID.x + 0]],
+                                     pos[index[3 * gl_GlobalInvocationID.x + 1]],
+                                     pos[index[3 * gl_GlobalInvocationID.x + 2]]);
+    mat3x4 matrixNDC = matrixVP * matrixVert;
+    matrixNDC[0].xyz /= matrixNDC[0].w;
+    matrixNDC[1].xyz /= matrixNDC[1].w;
+    matrixNDC[2].xyz /= matrixNDC[2].w;
+
+    const uvec2 resolution = imageSize(spinlock);
+    matrixNDC[0].xy = (matrixNDC[0].xy * .5f + .5f) * resolution;
+    matrixNDC[1].xy = (matrixNDC[1].xy * .5f + .5f) * resolution;
+    matrixNDC[2].xy = (matrixNDC[2].xy * .5f + .5f) * resolution;
+
+    const ivec2 screen[3] = ivec2[](
+        ivec2(matrixNDC[0].xy), 
+        ivec2(matrixNDC[1].xy), 
+        ivec2(matrixNDC[2].xy)
+    );
+
+    const vec3 normal = cross(matrixNDC[1].xyz - matrixNDC[0].xyz, matrixNDC[2].xyz - matrixNDC[1].xyz);
+    const ivec2 minBound = min(screen[0], min(screen[1], screen[2]));
+    const ivec2 maxBound = max(screen[0], max(screen[1], screen[2]));
+    if(minBound.x == maxBound.x || minBound.y == maxBound.y || normal.z > .0f || (maxBound.x < 0 && maxBound.y < 0) || (minBound.x >= resolution.x && minBound.y >= resolution.y)) // cull subpixel, completely outside screen and back faces
+        return;
+    
+    const vec2 dz = (normal.z == 0) ? vec2(0) : vec2(-normal.x / normal.z, -normal.y / normal.z);
+    const int y0 = minBound.y;
+    const int y1 = maxBound.y;
+
+    // prepare 3 edges
+    // do a simple sort to guarantee we can scan edges in order
+    // 0 -> top most short edge
+    // 1 -> the other short edge
+    // 2 -> the long edge(its dy == dy of face)
+    float invSlope[3];
+    float xStart[3];
+    int dy[3];
+    uint collapsedEdgeIndex = 0x7FFFFFFF;
+    uint shortEdgeIndices[2];
+    uint longEdgeIndices[2] = uint[](0x7FFFFFFF, 0x7FFFFFFF);
+    [[unroll]]
+    for(uint i = 0; i < 3; ++i)
+    {
+        const uint j0 = i, j1 = (i + 1) % 3;
+        if(screen[j0].y == screen[j1].y)
+        {
+            // apparently now a triangle can only have 1 edge parrallel to y axis
+            dy[i] = 0;
+            collapsedEdgeIndex = i;
+            continue;
+        }
+
+        invSlope[i] = (matrixNDC[j0].x - matrixNDC[j1].x) / (screen[j0].y - screen[j1].y);
+        xStart[i] = screen[j0].y < screen[j1].y ? matrixNDC[j0].x : matrixNDC[j1].x;
+        int yStart = screen[j0].y < screen[j1].y ? screen[j0].y : screen[j1].y;
+
+        // for triangle edges where top vertices are in center, offset them by 1 down
+        xStart[i] += (yStart > screen[(j0 + 2) % 3].y) ? invSlope[i] : 0;
+        dy[i] = (yStart > screen[(j0 + 2) % 3].y) ? abs(screen[j0].y - screen[j1].y) - 1 : abs(screen[j0].y - screen[j1].y);
+
+        bool isLongEdge = (y0 == yStart && (y1 - y0) == dy[i]);
+        const uint longEdgeIndicesIndex = longEdgeIndices[0] == 0x7FFFFFFF ? 0 : 1;
+        longEdgeIndices[longEdgeIndicesIndex] = isLongEdge ? i : longEdgeIndices[longEdgeIndicesIndex];
+        const uint shortEdgeIndicesIndex = (yStart > screen[(j0 + 2) % 3].y) ? 1 : 0;
+        shortEdgeIndices[shortEdgeIndicesIndex] = isLongEdge ? shortEdgeIndices[shortEdgeIndicesIndex] : i;
+    }
+
+    uint activeEdge = collapsedEdgeIndex == 0x7FFFFFFF ? shortEdgeIndices[0] : longEdgeIndices[1];
+    int yIntervalLeft = dy[activeEdge];
+    float xStartCurrent = xStart[activeEdge];
+    float xEndCurrent = xStart[longEdgeIndices[0]];
+    const uint scanlineIndexOffset = atomicAdd(scanlineCount, y1 - y0 + 1);
+    const vec3 faceNormal = normalize(cross(matrixVert[1].xyz - matrixVert[0].xyz, matrixVert[2].xyz - matrixVert[1].xyz));
+    memoryBarrier();
+
+    for(int i = 0; i <= (y1 - y0); ++i)
+    {
+        filledLines[scanlineIndexOffset + i] = ScanlineAttribute(faceNormal, min(xStartCurrent, xEndCurrent), max(xStartCurrent, xEndCurrent), y0 + i, 
+                                                                 matrixNDC[0].z + dot(dz, vec2(min(xStartCurrent, xEndCurrent) - matrixNDC[0].x, y0 + i - screen[0].y)), dz.x);
+
+        activeEdge = (yIntervalLeft == 0) ? shortEdgeIndices[1] : activeEdge;
+        xStartCurrent = (yIntervalLeft == 0) ? xStart[activeEdge] : xStartCurrent + invSlope[activeEdge];
+        xEndCurrent += invSlope[longEdgeIndices[0]];
+        yIntervalLeft = (yIntervalLeft == 0) ? dy[activeEdge] : yIntervalLeft - 1;
+    }
+
+    barrier();
+    workgroupCount = uvec3(ceil(scanlineCount / 1024), 1, 1);
+}
